@@ -86,6 +86,22 @@ unsafe extern "C" {
     fn CGEventGetIntegerValueField(event: EventRef, field: u32) -> i64;
 }
 
+// Secure Event Input is HIToolbox state, re-exported by Carbon rather than
+// ApplicationServices, so this declaration needs its own framework link.
+type Boolean = u8;
+
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn IsSecureEventInputEnabled() -> Boolean;
+}
+
+/// Reports whether any process holds Secure Event Input, which disables
+/// filtering event taps with `kCGEventTapDisabledByUserInput`.
+pub fn secure_event_input_enabled() -> bool {
+    // SAFETY: HIToolbox's secure-input query reads process-independent state.
+    unsafe { IsSecureEventInputEnabled() != 0 }
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFMachPortCreateRunLoopSource(
@@ -472,6 +488,17 @@ unsafe extern "C" fn event_callback(
         event_type,
         EVENT_TAP_DISABLED_BY_TIMEOUT | EVENT_TAP_DISABLED_BY_USER_INPUT
     ) {
+        if event_type == EVENT_TAP_DISABLED_BY_TIMEOUT {
+            tracing::warn!("event tap disabled by timeout");
+        } else {
+            tracing::warn!("event tap disabled by user input (secure input likely)");
+        }
+        // Sample the flag at the moment of the disable: it is the actual cause
+        // signal for user-input disables and clears as soon as focus moves.
+        tracing::warn!(
+            secure_event_input_enabled = secure_event_input_enabled(),
+            "secure event input state at tap disable"
+        );
         for tap in [
             &context.key_tap,
             &context.modifier_tap,

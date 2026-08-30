@@ -43,6 +43,10 @@ const ORDERING_GRACE: Duration = Duration::from_millis(250);
 /// asleep, or mid-reconfiguration (`CVDisplayLinkCreateWithActiveCGDisplays`
 /// fails with `-6661` there). The maintain tick renders frames meanwhile.
 const DISPLAY_LINK_RETRY_INTERVAL: Duration = Duration::from_millis(1_000);
+/// Secure Event Input is polled from the maintain tick but at most once per
+/// second; transitions are logged so an engaged password field that silences
+/// the event tap is diagnosable without spamming the 16 ms loop.
+const SECURE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(1_000);
 
 #[derive(Clone, Copy, Debug)]
 pub enum DictationIndicatorEvent {
@@ -181,6 +185,8 @@ struct MetalIndicator {
     ordered_at: Option<Instant>,
     ordering_retry_logged: bool,
     degraded_logged: bool,
+    secure_input_enabled: bool,
+    secure_input_checked_at: Option<Instant>,
     screen_label: Option<String>,
 }
 
@@ -276,6 +282,8 @@ impl MetalIndicator {
             ordered_at: None,
             ordering_retry_logged: false,
             degraded_logged: false,
+            secure_input_enabled: false,
+            secure_input_checked_at: None,
             screen_label: None,
         };
         indicator.ensure_display_link();
@@ -304,6 +312,7 @@ impl MetalIndicator {
     }
 
     fn maintain(&mut self) {
+        self.watch_secure_input();
         if self.renderer.is_active() {
             self.position_on_pointer_screen();
             self.ensure_ordered_front();
@@ -322,6 +331,30 @@ impl MetalIndicator {
             // Report degradation and recovery once per dictation episode.
             self.degraded_logged = false;
             self.display_link_retry_at = None;
+        }
+    }
+
+    /// Polls HIToolbox Secure Event Input at a coarse interval and warns only
+    /// on transitions: engagement explains a dictation tap going dead with
+    /// `kCGEventTapDisabledByUserInput`, while release marks its recovery.
+    fn watch_secure_input(&mut self) {
+        let now = Instant::now();
+        if self
+            .secure_input_checked_at
+            .is_some_and(|checked_at| now.duration_since(checked_at) < SECURE_INPUT_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.secure_input_checked_at = Some(now);
+        let enabled = crate::suppression::secure_event_input_enabled();
+        if enabled == self.secure_input_enabled {
+            return;
+        }
+        self.secure_input_enabled = enabled;
+        if enabled {
+            tracing::warn!("secure input engaged");
+        } else {
+            tracing::warn!("secure input released");
         }
     }
 

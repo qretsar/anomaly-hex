@@ -18,7 +18,7 @@ use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSEvent, NSScreen, NSStatusWindowLevel, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::CALayer;
@@ -35,6 +35,14 @@ const HIDDEN_SCALE: f32 = 0.82;
 const HIDDEN_SOFTNESS: f32 = 4.0;
 const PROCESSING_MORPH_DURATION: Duration = Duration::from_millis(250);
 const RECORDING_FLASH_HALF_LIFE: Duration = Duration::from_millis(280);
+/// How long an ordering attempt is trusted before the WindowServer-reported
+/// occlusion state alone decides visibility. AppKit publishes occlusion
+/// asynchronously, so checking earlier would see stale invisible states.
+const ORDERING_GRACE: Duration = Duration::from_millis(250);
+/// Bound on display-link recreation attempts while the displays are locked,
+/// asleep, or mid-reconfiguration (`CVDisplayLinkCreateWithActiveCGDisplays`
+/// fails with `-6661` there). The maintain tick renders frames meanwhile.
+const DISPLAY_LINK_RETRY_INTERVAL: Duration = Duration::from_millis(1_000);
 
 #[derive(Clone, Copy, Debug)]
 pub enum DictationIndicatorEvent {
@@ -167,9 +175,54 @@ impl DictationIndicatorUi {
 struct MetalIndicator {
     window: Retained<NSWindow>,
     renderer: Arc<SharedRenderer>,
-    display_link: CVDisplayLink,
-    display_link_context: *const SharedRenderer,
+    display_link: Option<DisplayLink>,
+    display_link_retry_at: Option<Instant>,
     ordered: bool,
+    ordered_at: Option<Instant>,
+    ordering_retry_logged: bool,
+    degraded_logged: bool,
+    screen_label: Option<String>,
+}
+
+/// Owns a `CVDisplayLink` together with the `SharedRenderer` clone handed to
+/// its callback, so the raw context pointer can never outlive its `Arc`.
+struct DisplayLink {
+    link: CVDisplayLink,
+    context: *const SharedRenderer,
+}
+
+impl DisplayLink {
+    fn create(renderer: &Arc<SharedRenderer>) -> Result<Self, CVReturn> {
+        let link = CVDisplayLink::from_active_cg_displays()?;
+        let context = Arc::into_raw(renderer.clone());
+        if let Err(status) = unsafe {
+            link.set_output_callback(display_link_callback, context.cast_mut().cast::<c_void>())
+        } {
+            // The callback never took ownership of the clone; reclaim it.
+            drop(unsafe { Arc::from_raw(context) });
+            return Err(status);
+        }
+        Ok(Self { link, context })
+    }
+
+    fn start(&self) -> Result<(), CVReturn> {
+        self.link.start()
+    }
+
+    fn stop(&self) {
+        let _ = self.link.stop();
+    }
+
+    fn is_running(&self) -> bool {
+        self.link.is_running()
+    }
+}
+
+impl Drop for DisplayLink {
+    fn drop(&mut self) {
+        self.stop();
+        drop(unsafe { Arc::from_raw(self.context) });
+    }
 }
 
 impl MetalIndicator {
@@ -214,24 +267,18 @@ impl MetalIndicator {
         );
         unsafe { window.setReleasedWhenClosed(false) };
 
-        let display_link = CVDisplayLink::from_active_cg_displays()
-            .map_err(|status| format!("could not create display link: {status}"))?;
-        let display_link_context = Arc::into_raw(renderer.clone());
-        unsafe {
-            display_link.set_output_callback(
-                display_link_callback,
-                display_link_context.cast_mut().cast::<c_void>(),
-            )
-        }
-        .map_err(|status| format!("could not configure display link: {status}"))?;
-
         let mut indicator = Self {
             window,
             renderer,
-            display_link,
-            display_link_context,
+            display_link: None,
+            display_link_retry_at: None,
             ordered: false,
+            ordered_at: None,
+            ordering_retry_logged: false,
+            degraded_logged: false,
+            screen_label: None,
         };
+        indicator.ensure_display_link();
         indicator.position_on_pointer_screen();
         Ok(indicator)
     }
@@ -243,33 +290,145 @@ impl MetalIndicator {
             DictationIndicatorEvent::Started | DictationIndicatorEvent::EditingStarted
         ) {
             self.position_on_pointer_screen();
-            self.window.orderFrontRegardless();
-            self.ordered = true;
+            self.order_front();
+            // Ordering can fail without an error, so verify it synchronously
+            // and retry once; the maintain tick re-checks from here on.
+            if !self.window.isVisible() {
+                self.window.orderFrontRegardless();
+                tracing::debug!(
+                    "dictation indicator was not visible after ordering; ordered again"
+                );
+            }
             tracing::info!("Metal dictation indicator shown");
-        }
-        if !self.display_link.is_running()
-            && let Err(status) = self.display_link.start()
-        {
-            tracing::error!(status, "could not start indicator display link");
         }
     }
 
     fn maintain(&mut self) {
         if self.renderer.is_active() {
             self.position_on_pointer_screen();
-            if !self.ordered {
-                self.window.orderFrontRegardless();
-                self.ordered = true;
-            }
+            self.ensure_ordered_front();
+            self.ensure_display_link();
+            self.draw_tick();
         } else {
-            if self.display_link.is_running() {
-                let _ = self.display_link.stop();
+            if let Some(link) = &self.display_link
+                && link.is_running()
+            {
+                link.stop();
             }
             if self.ordered {
                 self.window.orderOut(None);
                 self.ordered = false;
             }
+            // Report degradation and recovery once per dictation episode.
+            self.degraded_logged = false;
+            self.display_link_retry_at = None;
         }
+    }
+
+    fn order_front(&mut self) {
+        self.window.orderFrontRegardless();
+        self.ordered = true;
+        self.ordered_at = Some(Instant::now());
+    }
+
+    /// The WindowServer confirms both ordering and on-screen compositing;
+    /// AppKit's own `isVisible` can stay true after a silent drop across a
+    /// space, display, or wake transition.
+    fn visible_on_screen(&self) -> bool {
+        self.window.isVisible()
+            && self
+                .window
+                .occlusionState()
+                .contains(NSWindowOcclusionState::Visible)
+    }
+
+    /// Re-issues front-most ordering while the HUD is active whenever the
+    /// WindowServer dropped it, instead of trusting the one-shot `ordered`
+    /// latch for the whole dictation.
+    fn ensure_ordered_front(&mut self) {
+        if self.visible_on_screen() {
+            self.ordering_retry_logged = false;
+            return;
+        }
+        if self
+            .ordered_at
+            .is_some_and(|ordered_at| ordered_at.elapsed() < ORDERING_GRACE)
+        {
+            return;
+        }
+        self.order_front();
+        if !self.ordering_retry_logged {
+            tracing::debug!("dictation indicator is not visible; ordered front regardless");
+            self.ordering_retry_logged = true;
+        }
+    }
+
+    /// Recreates and starts the display link when it is missing or stopped.
+    /// Attempts are bounded to one per retry interval so repeated failures on
+    /// a locked or sleeping display cannot spam every event or tick.
+    fn ensure_display_link(&mut self) {
+        if self
+            .display_link
+            .as_ref()
+            .is_some_and(|link| link.is_running())
+        {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .display_link_retry_at
+            .is_some_and(|retry_at| now < retry_at)
+        {
+            return;
+        }
+        self.display_link_retry_at = Some(now + DISPLAY_LINK_RETRY_INTERVAL);
+        if self.display_link.is_none() {
+            match DisplayLink::create(&self.renderer) {
+                Ok(link) => self.display_link = Some(link),
+                Err(status) => {
+                    self.enter_degraded_mode(status);
+                    return;
+                }
+            }
+        }
+        let started = self
+            .display_link
+            .as_ref()
+            .expect("display link exists after creation")
+            .start();
+        match started {
+            Ok(()) => {
+                if self.degraded_logged {
+                    tracing::debug!("dictation indicator display link recovered");
+                    self.degraded_logged = false;
+                }
+            }
+            Err(status) => self.enter_degraded_mode(status),
+        }
+    }
+
+    fn enter_degraded_mode(&mut self, status: CVReturn) {
+        if self.degraded_logged {
+            return;
+        }
+        self.degraded_logged = true;
+        tracing::debug!(
+            status,
+            "dictation indicator display link unavailable; driving frames from the maintain tick"
+        );
+    }
+
+    /// Presents one frame from the maintain tick while the display link is
+    /// unavailable, keeping the HUD animating without it.
+    fn draw_tick(&mut self) {
+        if self
+            .display_link
+            .as_ref()
+            .is_some_and(|link| link.is_running())
+        {
+            return;
+        }
+        self.renderer.draw();
     }
 
     fn position_on_pointer_screen(&mut self) {
@@ -278,15 +437,28 @@ impl MetalIndicator {
         };
         let pointer = NSEvent::mouseLocation();
         let screens = NSScreen::screens(mtm);
-        let Some(screen) = screens.iter().find(|screen| {
-            let frame = screen.frame();
-            pointer.x >= frame.origin.x
-                && pointer.x < frame.origin.x + frame.size.width
-                && pointer.y >= frame.origin.y
-                && pointer.y < frame.origin.y + frame.size.height
-        }) else {
+        if screens.is_empty() {
             return;
-        };
+        }
+        let screen_index = screens
+            .iter()
+            .position(|screen| {
+                let frame = screen.frame();
+                pointer.x >= frame.origin.x
+                    && pointer.x < frame.origin.x + frame.size.width
+                    && pointer.y >= frame.origin.y
+                    && pointer.y < frame.origin.y + frame.size.height
+            })
+            // No display contains the pointer (locked screen, display asleep,
+            // or a stale cursor location); anchor the HUD to the primary
+            // screen, which is always first in the screens array.
+            .unwrap_or(0);
+        let screen = screens.objectAtIndex(screen_index);
+        let screen_label = format!("{} ({})", screen.localizedName(), screen_index);
+        if self.screen_label.as_deref() != Some(screen_label.as_str()) {
+            tracing::debug!(screen = %screen_label, "chose dictation indicator screen");
+            self.screen_label = Some(screen_label);
+        }
         let visible = screen.visibleFrame();
         let capsule_margin = f64::from((WINDOW_HEIGHT - CAPSULE_HEIGHT) / 2.0);
         let top_left = NSPoint::new(
@@ -305,8 +477,8 @@ impl MetalIndicator {
 
 impl Drop for MetalIndicator {
     fn drop(&mut self) {
-        let _ = self.display_link.stop();
-        unsafe { drop(Arc::from_raw(self.display_link_context)) };
+        // Dropping the display link stops it and reclaims the context Arc.
+        self.display_link.take();
         self.window.close();
     }
 }

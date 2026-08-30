@@ -16,6 +16,10 @@ use crate::audio::CaptureInstant;
 use crate::dictation::MINIMUM_HOLD_DURATION;
 
 const DOUBLE_TAP_WINDOW: Duration = MINIMUM_HOLD_DURATION;
+/// The lock gesture spans four physical edges, so its second press lands at a
+/// natural pace; macOS's own double-click interval is 500 ms. `double_tap_only`
+/// keeps the tighter window because it is a deliberate two-tap gesture.
+const DOUBLE_TAP_LOCK_WINDOW: Duration = Duration::from_millis(500);
 const ESCAPE_KEY_CODE: u16 = 53;
 
 const EVENT_LEFT_MOUSE_DOWN: u32 = 1;
@@ -973,7 +977,8 @@ impl DictationHotkey {
             }
             State::Idle if trigger_pressed => {
                 let previous_release = self.last_release_at.take().filter(|released| {
-                    self.double_tap_enabled && now.duration_since(*released) < DOUBLE_TAP_WINDOW
+                    self.double_tap_enabled
+                        && now.duration_since(*released) < DOUBLE_TAP_LOCK_WINDOW
                 });
                 self.state = State::Recording {
                     started_at: now,
@@ -984,7 +989,7 @@ impl DictationHotkey {
             State::Recording {
                 previous_release: Some(released),
                 ..
-            } if trigger_released && now.duration_since(released) < DOUBLE_TAP_WINDOW => {
+            } if trigger_released && now.duration_since(released) < DOUBLE_TAP_LOCK_WINDOW => {
                 self.state = State::Locked;
                 None
             }
@@ -1872,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slow_second_release_does_not_lock() {
+    fn a_natural_paced_double_tap_still_locks() {
         let now = capture_time();
         let mut hotkey = test_hotkey(false, now);
 
@@ -1886,6 +1891,35 @@ mod tests {
             hotkey.process(
                 InputEvent::Flags(NO_FLAGS),
                 now + Duration::from_millis(450)
+            ),
+            None
+        );
+        assert!(hotkey.is_recording());
+        assert_eq!(
+            hotkey.process(
+                InputEvent::Flags(OPTION_KEY_MASK),
+                now + Duration::from_secs(1)
+            ),
+            Some(HotkeyAction::Finish)
+        );
+        assert!(!hotkey.is_recording());
+    }
+
+    #[test]
+    fn a_slow_second_release_does_not_lock() {
+        let now = capture_time();
+        let mut hotkey = test_hotkey(false, now);
+
+        hotkey.process(InputEvent::Flags(OPTION_KEY_MASK), now);
+        hotkey.process(InputEvent::Flags(NO_FLAGS), now + Duration::from_millis(80));
+        hotkey.process(
+            InputEvent::Flags(OPTION_KEY_MASK),
+            now + Duration::from_millis(180),
+        );
+        assert_eq!(
+            hotkey.process(
+                InputEvent::Flags(NO_FLAGS),
+                now + Duration::from_millis(800)
             ),
             Some(HotkeyAction::Finish)
         );

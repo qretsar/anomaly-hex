@@ -81,6 +81,7 @@ unsafe extern "C" {
         user_info: *mut c_void,
     ) -> *mut c_void;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+    fn CGEventTapIsEnabled(tap: *mut c_void) -> Boolean;
     fn CGEventGetFlags(event: EventRef) -> u64;
     fn CGEventGetTimestamp(event: EventRef) -> u64;
     fn CGEventGetIntegerValueField(event: EventRef, field: u32) -> i64;
@@ -306,9 +307,12 @@ struct EventTapContext {
     sender: Sender<ObservedInputEvent>,
     activity: InputActivity,
     escape_cancels: Arc<AtomicBool>,
-    key_tap: AtomicPtr<c_void>,
-    modifier_tap: AtomicPtr<c_void>,
-    observation_tap: AtomicPtr<c_void>,
+    // The tap pointers are shared with the health monitor so teardown can null
+    // them and the monitor observes released taps only as null slots.
+    key_tap: Arc<AtomicPtr<c_void>>,
+    modifier_tap: Arc<AtomicPtr<c_void>>,
+    observation_tap: Arc<AtomicPtr<c_void>>,
+    health_shutdown: Arc<AtomicBool>,
     shortcut_suppression: Mutex<ShortcutSuppression>,
     pending: PendingInputEvents,
     next_sequence: AtomicU64,
@@ -323,13 +327,18 @@ fn run_event_tap(
     run_loop: Arc<AtomicPtr<c_void>>,
     ready: SyncSender<Result<()>>,
 ) {
+    let key_tap_slot = Arc::new(AtomicPtr::new(ptr::null_mut()));
+    let modifier_tap_slot = Arc::new(AtomicPtr::new(ptr::null_mut()));
+    let observation_tap_slot = Arc::new(AtomicPtr::new(ptr::null_mut()));
+    let health_shutdown = Arc::new(AtomicBool::new(false));
     let context = Box::into_raw(Box::new(EventTapContext {
         sender,
         activity,
         escape_cancels,
-        key_tap: AtomicPtr::new(ptr::null_mut()),
-        modifier_tap: AtomicPtr::new(ptr::null_mut()),
-        observation_tap: AtomicPtr::new(ptr::null_mut()),
+        key_tap: Arc::clone(&key_tap_slot),
+        modifier_tap: Arc::clone(&modifier_tap_slot),
+        observation_tap: Arc::clone(&observation_tap_slot),
+        health_shutdown: Arc::clone(&health_shutdown),
         shortcut_suppression: Mutex::new(ShortcutSuppression::default()),
         pending,
         next_sequence: AtomicU64::new(0),
@@ -448,9 +457,30 @@ fn run_event_tap(
         CGEventTapEnable(modifier_tap, true);
         CGEventTapEnable(observation_tap, true);
     }
+    spawn_tap_health_monitor(
+        Arc::clone(&key_tap_slot),
+        Arc::clone(&modifier_tap_slot),
+        Arc::clone(&observation_tap_slot),
+        Arc::clone(&health_shutdown),
+    );
     let _ = ready.send(Ok(()));
     // SAFETY: This dedicated thread exists solely to dispatch the event taps.
     unsafe { CFRunLoopRun() };
+    // Halt the health monitor before the taps are disabled and released below.
+    // It is deliberately not joined: the flag guarantees its exit within one
+    // second, the nulled slots hide the taps from it, and it rechecks the flag
+    // before every CGEventTap call so it never touches a freed tap.
+    // SAFETY: `context` remains owned by this event-tap thread.
+    unsafe {
+        (*context).health_shutdown.store(true, Ordering::Release);
+        (*context).key_tap.store(ptr::null_mut(), Ordering::Release);
+        (*context)
+            .modifier_tap
+            .store(ptr::null_mut(), Ordering::Release);
+        (*context)
+            .observation_tap
+            .store(ptr::null_mut(), Ordering::Release);
+    }
     // SAFETY: Disable the taps before releasing their shared callback context.
     unsafe {
         CGEventTapEnable(key_tap, false);
@@ -471,6 +501,53 @@ fn run_event_tap(
         CFRelease(observation_tap.cast_const());
         drop(Box::from_raw(context));
     }
+}
+
+/// Watches the created taps once per second and re-enables any that macOS
+/// disabled, covering disable notifications missed across sleep/wake (for
+/// example when Secure Event Input engages at the login window overnight).
+/// The handle is deliberately dropped, so the thread is never joined: teardown
+/// signals `shutdown` instead, which the loop checks before every CGEventTap
+/// call so it exits within one second without touching a released tap.
+fn spawn_tap_health_monitor(
+    key_tap: Arc<AtomicPtr<c_void>>,
+    modifier_tap: Arc<AtomicPtr<c_void>>,
+    observation_tap: Arc<AtomicPtr<c_void>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let taps = [
+            ("key", &key_tap),
+            ("modifier", &modifier_tap),
+            ("observation", &observation_tap),
+        ];
+        while !shutdown.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_secs(1));
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            for (name, tap_slot) in taps {
+                let tap = tap_slot.load(Ordering::Acquire);
+                if tap.is_null() || shutdown.load(Ordering::Acquire) {
+                    continue;
+                }
+                // SAFETY: `tap` is a CFMachPort returned by `CGEventTapCreate`; the
+                // shutdown flag was rechecked above, so teardown has not released it.
+                if unsafe { CGEventTapIsEnabled(tap) } != 0 {
+                    continue;
+                }
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                // SAFETY: `tap` is a CFMachPort returned by `CGEventTapCreate`.
+                unsafe { CGEventTapEnable(tap, true) };
+                tracing::warn!(
+                    tap = name,
+                    "re-enabled event tap after it was found disabled"
+                );
+            }
+        }
+    });
 }
 
 unsafe extern "C" fn event_callback(
